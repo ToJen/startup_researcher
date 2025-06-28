@@ -13,6 +13,7 @@ httpx = "^0.28.1"
 sqlmodel = "^0.0.24"
 openai = "^1.93.0"
 pydantic = "^2.11.7"
+firecrawl-py = "^2.12.0"
 
 [tool.poetry.scripts]
 startup-researcher = "main:app"

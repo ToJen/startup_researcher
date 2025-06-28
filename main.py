@@ -20,6 +20,7 @@ Env vars: PDL_KEY, NEWS_KEY, OPENAI_API_KEY, TVLY_KEY (opt), FC_KEY (opt), DATAB
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import logging
 import os
@@ -29,6 +30,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from firecrawl import FirecrawlApp
 from openai import OpenAI
 from pydantic import BaseModel
 from sqlalchemy import JSON
@@ -150,11 +152,49 @@ async def fetch_news(client: httpx.AsyncClient, query: str) -> Dict[str, Any]:
         r = await client.get(url, params=params, timeout=30)
         r.raise_for_status()
         data = r.json()
-        logger.info(f"Found {len(data.get('articles', []))} news articles for {query}")
-        return data
+        articles = data.get("articles", [])
+        if articles:
+            logger.info(f"Found {len(articles)} news articles for {query}")
+            return data
+        logger.info(f"No news articles found for {query}, using Firecrawl")
     except Exception as e:
         logger.error(f"Failed to fetch news for {query}: {e}")
-        return {}
+        logger.info(f"Falling back to Firecrawl for {query}")
+
+    # Firecrawl fallback using firecrawl-py >=2.12.0
+    try:
+        firecrawl_mod = importlib.util.find_spec("firecrawl")
+        if firecrawl_mod is None:
+            logger.error("firecrawl-py is not installed. Please install with 'pip install firecrawl-py'.")
+            return {"status": "error", "articles": []}
+        from firecrawl import FirecrawlApp
+
+        fc_key = os.getenv("FC_KEY")
+        if not fc_key:
+            logger.error("Firecrawl API key not configured (FC_KEY)")
+            return {"status": "error", "articles": []}
+        app = FirecrawlApp(api_key=fc_key)
+        scrape_result = app.scrape_url(query, formats=["markdown"])
+        scrape_result = scrape_result.dict()
+        data = scrape_result.get("data", {})
+        metadata = data.get("metadata", {})
+        title = metadata.get("title", "")
+        url = metadata.get("sourceURL", "")
+        content = data.get("markdown", "")
+        articles = []
+        if title or content:
+            articles.append(
+                {
+                    "title": title,
+                    "url": url,
+                    "content": content,
+                }
+            )
+        logger.info(f"Firecrawl returned {len(articles)} articles for {query}")
+        return {"status": "ok", "articles": articles}
+    except Exception as e:
+        logger.error(f"Firecrawl fallback failed for {query}: {e}")
+        return {"status": "error", "articles": []}
 
 
 async def fetch_tavily(client: httpx.AsyncClient, query: str) -> Dict[str, Any]:
@@ -177,19 +217,22 @@ async def fetch_tavily(client: httpx.AsyncClient, query: str) -> Dict[str, Any]:
         return {}
 
 
-async def fetch_firecrawl(client: httpx.AsyncClient, pattern: str) -> Dict[str, Any]:
+async def fetch_firecrawl(client: httpx.AsyncClient, pattern: str) -> dict:
     key = os.getenv("FC_KEY")
     if not key:
         logger.info("Firecrawl API key not configured, skipping")
         return {}
     try:
         logger.info(f"Fetching Firecrawl data for {pattern}")
-        url = "https://api.firecrawl.dev/crawl"
-        r = await client.post(url, json={"urls": [pattern]}, headers={"Authorization": key}, timeout=60)
-        r.raise_for_status()
-        data = r.json()
+        app = FirecrawlApp(api_key=key)
+        import asyncio
+
+        loop = asyncio.get_event_loop()
+        # scrape_url is synchronous, so run in executor
+        result = await loop.run_in_executor(None, lambda: app.scrape_url(pattern, formats=["markdown", "html"]))
+        result = result.dict()
         logger.info(f"Successfully fetched Firecrawl data for {pattern}")
-        return data
+        return result
     except Exception as e:
         logger.error(f"Failed to fetch Firecrawl data for {pattern}: {e}")
         return {}
@@ -218,7 +261,11 @@ async def enrich_startup(startup_id: int, domain: str):
 
         with Session(engine) as session:
             for k, v in payloads.items():
-                if isinstance(v, Exception) or v in ({}, []):
+                logger.debug(f"Storing key={k}, type={type(v)}")
+                if isinstance(v, Exception):
+                    continue
+                if contains_callable(v):
+                    logger.error(f"Payload for key={k} contains a function! Value: {v}")
                     continue
                 session.add(StartupData(startup_id=startup_id, key=k, data=json.dumps(v)))
             startup = session.exec(select(Startup).where(Startup.id == startup_id)).one()
@@ -394,11 +441,22 @@ def revenue_stats() -> dict:  # reused by REST
     try:
         with Session(engine) as s:
             rows = s.exec(select(StartupData.data).where(StartupData.key == "pdl")).all()
-        mids = [_revenue_mid(json.loads(r.data).get("inferred_revenue")) for r in rows if r.data]
-        return {"average_midpoint_usd": (sum(mids) // len(mids)) if mids else 0, "count": len(mids)}
+        # rows is a list of strings (JSON), not objects with .data
+        totals = []
+        for r in rows:
+            # r is a string (the JSON)
+            data = json.loads(r) if isinstance(r, str) else r
+            # Try both possible locations for funding
+            val = data.get("total_funding_raised") or (data.get("funding") or {}).get("total_funding_usd") or 0
+            try:
+                val = int(val)
+            except Exception:
+                val = 0
+            totals.append(val)
+        return {"average_total_funding_raised": (sum(totals) // len(totals)) if totals else 0, "count": len(totals)}
     except Exception as e:
         logger.error(f"Failed to get revenue stats: {e}")
-        return {"average_midpoint_usd": 0, "count": 0}
+        return {"average_total_funding_raised": 0, "count": 0}
 
 
 agent_prompt = (
@@ -461,7 +519,7 @@ async def chat(user_question: str):
 
         # First call to get tool calls
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4o",
             messages=messages,
             tools=tools,
             tool_choice="auto",
@@ -493,7 +551,7 @@ async def chat(user_question: str):
 
             # Get final response
             final_response = client.chat.completions.create(
-                model="gpt-4o-mini",
+                model="gpt-4o",
                 messages=messages,
             )
             answer = final_response.choices[0].message.content
@@ -515,3 +573,14 @@ if __name__ == "__main__":
 
     logger.info("Starting Startup Research Assistant")
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
+
+# Utility to check for any callable in a nested structure
+def contains_callable(obj):
+    if callable(obj):
+        return True
+    if isinstance(obj, dict):
+        return any(contains_callable(v) for v in obj.values())
+    if isinstance(obj, list):
+        return any(contains_callable(i) for i in obj)
+    return False
