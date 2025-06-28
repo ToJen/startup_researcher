@@ -1,0 +1,22 @@
+[tool.poetry]
+name = "startup-researcher"
+version = "1.0.0"
+description = "AI-powered startup research assistant"
+authors = ["Your Name <your.email@example.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.9"
+fastapi = "^0.115.14"
+uvicorn = {extras = ["standard"], version = "0.35.0"}
+httpx = "^0.28.1"
+sqlmodel = "^0.0.24"
+openai = "^1.93.0"
+pydantic = "^2.11.7"
+
+[tool.poetry.scripts]
+startup-researcher = "main:app"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
